@@ -47,6 +47,14 @@ class PanAligner:
 # ---------------------------------------------------------------------------
 # 核心函数
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 基线模型: 仅 pan 输入 (对比实验用)
+# ---------------------------------------------------------------------------
+# PanAligner fallback 警告去重: 同一场景只警告一次(训练循环中同一文件每个
+# epoch 都会触发, 原实现导致警告刷屏).
+_WARNED_SCENES = set()
+
+
 def resample_pan_to_b2(pan_path, reg_txt_path):
     """把 pan 重采样到 b2 网格 (1456x1088)。fallback 场景用中位 H。
 
@@ -55,6 +63,8 @@ def resample_pan_to_b2(pan_path, reg_txt_path):
                并打印 warning log, 不再静默吞掉 FileNotFoundError 等真实错误.
       - P2#18: cv2.remap 边界填充从 BORDER_CONSTANT(0) 改为 BORDER_REFLECT,
                避免硬黑边被模型当作伪特征.
+    v2 修复: fallback 警告按场景去重(每个 reg_txt_path 只警告一次),
+             避免训练时警告刷屏.
     """
     import warnings
     pan = tifffile.imread(str(pan_path))  # uint16
@@ -62,9 +72,13 @@ def resample_pan_to_b2(pan_path, reg_txt_path):
         pa = PanAligner(reg_txt_path)
         PX, PY = pa.b2_grid_to_pan_out()
     except (ValueError, KeyError, OSError) as e:
-        # Fallback: SIFT 失败场景，用全局中位 H
-        warnings.warn(f"PanAligner parse failed for {reg_txt_path}: {e}. "
-                      "Falling back to median H matrix.", UserWarning, stacklevel=2)
+        # Fallback: SIFT 失败场景，用全局中位 H (每场景只警告一次)
+        if str(reg_txt_path) not in _WARNED_SCENES:
+            _WARNED_SCENES.add(str(reg_txt_path))
+            warnings.warn(f"PanAligner parse failed for {reg_txt_path}: {e}. "
+                          "Falling back to median H matrix. "
+                          f"(total fallback scenes so far: {len(_WARNED_SCENES)})",
+                          UserWarning, stacklevel=2)
         with open(MEDIAN_H_PATH) as f:
             fb = json.load(f)
         H_mat = np.array(fb["H"], dtype=np.float64)

@@ -42,6 +42,7 @@ def load_metrics(path):
 def extract_key_metrics(m, source="val"):
     """提取关键指标. source: 'val' or 'test'.
     兼容新旧格式: final_val (新) / final_metrics (旧) / best_val.
+    v2: 若 metrics 含 balance score 原始数据则计算, 否则用 best_score 字段.
     """
     if m is None:
         return None
@@ -57,11 +58,26 @@ def extract_key_metrics(m, source="val"):
                     "per_class_IoU": {}, "per_class_F1": {}}
     if not data:
         return None
+    # v2: balance score (有 P/R 数据则计算)
+    score = m.get("best_score")
+    if data.get("per_class_Precision") and data.get("per_class_Recall"):
+        try:
+            import sys as _sys
+            _p = Path(__file__).resolve().parent
+            if str(_p) not in _sys.path:
+                _sys.path.insert(0, str(_p))
+            from train import compute_balance_score as _cbs
+            score = _cbs(data)
+        except Exception:
+            pass
     return {
         "mIoU": data.get("mIoU", 0),
         "OA": data.get("OA", 0),
+        "score": score,
         "per_class_IoU": {c: data.get("per_class_IoU", {}).get(c, 0) for c in DEFECT_CLASSES},
         "per_class_F1": {c: data.get("per_class_F1", {}).get(c, 0) for c in DEFECT_CLASSES},
+        "per_class_Precision": {c: data.get("per_class_Precision", {}).get(c, 0) for c in DEFECT_CLASSES},
+        "per_class_Recall": {c: data.get("per_class_Recall", {}).get(c, 0) for c in DEFECT_CLASSES},
     }
 
 
@@ -149,7 +165,7 @@ def plot_training_curves_comparison(b_hist, m_hist, out_path):
     import matplotlib; matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    fig, (a1, a2) = plt.subplots(1, 2, figsize=(16, 5))
+    fig, (a1, a2, a3) = plt.subplots(1, 3, figsize=(20, 5))
 
     if b_hist:
         a1.plot(b_hist.get("train_loss", []), label="Baseline train", color="#e74c3c")
@@ -166,6 +182,20 @@ def plot_training_curves_comparison(b_hist, m_hist, out_path):
     if m_hist:
         a2.plot(m_hist.get("val_miou", []), label="Multispectral", color="#3498db")
     a2.set_title("Validation mIoU Comparison"); a2.set_xlabel("Epoch"); a2.legend()
+
+    # v2: balance score 曲线
+    has_score = (b_hist and b_hist.get("val_score")) or (m_hist and m_hist.get("val_score"))
+    if has_score:
+        if b_hist and b_hist.get("val_score"):
+            a3.plot(b_hist.get("val_score", []), label="Baseline", color="#e74c3c")
+        if m_hist and m_hist.get("val_score"):
+            a3.plot(m_hist.get("val_score", []), label="Multispectral", color="#3498db")
+        a3.set_title("Balance Score Comparison")
+    else:
+        a3.text(0.5, 0.5, "score not available\n(train with v2 scripts)",
+                ha="center", transform=a3.transAxes)
+        a3.set_title("Balance Score (N/A)")
+    a3.set_xlabel("Epoch"); a3.legend()
 
     plt.tight_layout()
     plt.savefig(out_path, dpi=120, bbox_inches="tight")
@@ -296,6 +326,12 @@ def generate_html_report(baseline_m, multispec_m, b_full, m_full, out_path):
       <th>Δ (Multi - Base)</th>
     </tr>
     <tr>
+      <td><strong>Balance Score (综合评分)</strong></td>
+      <td>{fmt(b.get('score'))}</td>
+      <td>{fmt(m.get('score'))}</td>
+      <td>{delta(b.get('score'), m.get('score'))}</td>
+    </tr>
+    <tr>
       <td><strong>mIoU</strong></td>
       <td>{fmt(b.get('mIoU'))}</td>
       <td>{fmt(m.get('mIoU'))}</td>
@@ -308,6 +344,10 @@ def generate_html_report(baseline_m, multispec_m, b_full, m_full, out_path):
       <td>{delta(b.get('OA'), m.get('OA'))}</td>
     </tr>
   </table>
+  <p style="color:#7f8c8d;font-size:13px;">
+    Balance Score = 0.40·mIoU + 0.30·meanDefectF1 + 0.15·meanDefectP + 0.15·meanDefectR − 0.10·meanDefect|P−R|
+    （仅缺陷类计算 F1/P/R，避免背景主导；含 P-R 平衡惩罚）
+  </p>
 
   <h2>3. 分类别指标对比</h2>
   <table>

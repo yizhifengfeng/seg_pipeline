@@ -19,6 +19,22 @@ import numpy as np
 
 
 # ---------------------------------------------------------------------------
+# v4 Focal alpha 权重 (2026-11-04, 基于 v3 重训 50 epoch 诊断微调)
+# ---------------------------------------------------------------------------
+# v3 算法 (sqrt 逆频率 + bg 下限) 给出 [0.5, 0.89, 0.87, 1.17, 1.94],
+# 成功修复 v2 的 820:1 失衡坍缩 (mIoU 0.0664 -> 0.3971).
+# 但 v3 重训 50 epoch 后的 test per-class 诊断仍暴露:
+#   bio: P=0.215 / R=0.842  -> 严重过度预测 (太多像素被误判为 bio)
+#   hollow: P=0.222 / R=0.323 -> 严重欠预测 (真实 hollow 大量漏检)
+# v4 在 v3 基础上手工微调:
+#   bio 0.87 -> 0.65  (降权, 收紧 bio 的预测触发)
+#   hollow 1.94 -> 2.30 (提权, 鼓励模型多预测 hollow)
+#   其余保持 v3 (bg 0.5 下限 / crack 0.90 / flaking 1.17)
+# max/min = 2.30 / 0.5 = 4.6:1 (v3 是 3.9:1, v2 是 820:1; 仍远低于崩塌阈值)
+FOCAL_ALPHA_V4 = [0.5, 0.90, 0.65, 1.17, 2.30]
+
+
+# ---------------------------------------------------------------------------
 # 1. Focal Loss (Lin et al., 2017)
 # ---------------------------------------------------------------------------
 class FocalLoss(nn.Module):
@@ -242,19 +258,46 @@ class CombinedLoss(nn.Module):
 # ---------------------------------------------------------------------------
 # Helper: compute inverse-frequency alpha from class pixel counts
 # ---------------------------------------------------------------------------
-def compute_focal_alpha(class_pixel_counts, num_classes=5):
-    """Compute alpha (per-class weight) from pixel counts.
+def compute_focal_alpha(class_pixel_counts=None, num_classes=5, bg_min=0.5,
+                        algorithm="v4"):
+    """Compute alpha (per-class weight).
 
-    Alpha = inverse frequency, normalized so mean=1.
-    Background (class 0) gets reduced weight to suppress it.
+    algorithm="v4" (默认, 2026-11-04 起推荐):
+        手工微调的 v4 权重 FOCAL_ALPHA_V4 = [0.5, 0.90, 0.65, 1.17, 2.30].
+        基于 v3 重训 50 epoch 的诊断:
+          bio P=0.215/R=0.842 过度预测 -> 降权 0.87->0.65
+          hollow P=0.222/R=0.323 欠预测 -> 提权 1.94->2.30
+        max/min = 4.6:1, 仍远低于 v2 的 820:1 崩塌阈值.
+        class_pixel_counts 参数在此模式下被忽略 (留作 API 兼容).
+
+    algorithm="sqrt_inverse" (v3 算法, fallback):
+        alpha = 1/sqrt(C*freq), normalize mean=1, bg 下限保护.
+        自动从 class_pixel_counts 计算, 权重比 ~3.9:1.
+        保留以便对照实验/调试.
+
+    v2 历史教训 (作背景):
+        旧版 alpha = 1/(C*freq) + bg*0.3 导致 background 权重 0.0034 vs hollow 2.81
+        (1:820), 模型学到 "全部预测成缺陷" 的捷径, mIoU 卡在 0.08.
+        v3/v4 都遵守 "权重比 <= ~5:1" 的安全约束.
+
+    Args:
+        class_pixel_counts: 每类像素数 (sqrt_inverse 模式必需, v4 模式可省略)
+        num_classes: 类别数 (仅 sqrt_inverse 模式使用)
+        bg_min: background 权重下限 (仅 sqrt_inverse 模式使用)
+        algorithm: "v4" (默认) 或 "sqrt_inverse"
     """
+    if algorithm == "v4":
+        return torch.tensor(FOCAL_ALPHA_V4, dtype=torch.float32)
+
+    # sqrt_inverse (v3 算法 fallback)
+    if class_pixel_counts is None:
+        raise ValueError("algorithm='sqrt_inverse' 必须提供 class_pixel_counts")
     counts = np.array(class_pixel_counts, dtype=np.float64)
     counts = np.maximum(counts, 1)
     freq = counts / counts.sum()
-    alpha = 1.0 / (num_classes * freq)  # inverse frequency
-    alpha = alpha / alpha.mean()  # normalize mean=1
-    # Explicitly down-weight background
-    alpha[0] = alpha[0] * 0.3  # background gets 30% weight
+    alpha = 1.0 / np.sqrt(num_classes * freq)  # sqrt 逆频率, 温和加权
+    alpha = alpha / alpha.mean()               # normalize mean=1
+    alpha[0] = max(alpha[0], bg_min)           # background 权重下限保护
     return torch.tensor(alpha, dtype=torch.float32)
 
 
@@ -277,10 +320,19 @@ if __name__ == "__main__":
     bl = BoundaryLoss(ignore_index=255).to(device)
     print(f"BoundaryLoss: {bl(logits, target).item():.4f}")
 
-    alpha = compute_focal_alpha([501586446, 9719840, 10129403, 5624990, 2038073])
-    print(f"Focal alpha: {alpha.tolist()}")
-    combined = CombinedLoss(alpha=alpha, ignore_index=255).to(device)
+    # v4 (默认) vs v3 算法对照
+    alpha_v4 = compute_focal_alpha()  # 默认 algorithm="v4"
+    alpha_v3 = compute_focal_alpha(
+        [501586446, 9719840, 10129403, 5624990, 2038073],
+        algorithm="sqrt_inverse",
+    )
+    print(f"\nFocal alpha (v4 default):         {alpha_v4.tolist()}")
+    print(f"  max/min ratio = {max(alpha_v4).item() / min(alpha_v4).item():.2f}:1")
+    print(f"Focal alpha (v3 sqrt_inverse):    {alpha_v3.tolist()}")
+    print(f"  max/min ratio = {max(alpha_v3).item() / min(alpha_v3).item():.2f}:1")
+
+    combined = CombinedLoss(alpha=alpha_v4, ignore_index=255).to(device)
     loss, parts = combined(logits, target)
-    print(f"Combined: {parts}")
+    print(f"\nCombined (v4): {parts}")
     loss.backward()
     print("Backward: OK")
