@@ -25,7 +25,8 @@ import cv2
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from config import (MASKS_DIR, NORM_STATS_PATH, OUTPUT_DIR, CLASS_NAMES,
-                    CLASS_COLORS_BGR, H, W, DEFAULT_GSD_MM, IGNORE_INDEX)
+                    CLASS_COLORS_BGR, H, W, DEFAULT_GSD_MM, IGNORE_INDEX,
+                    NUM_CLASSES)
 from build_input_tensor import load_6channel, normalize_tensor
 from model import DeepLabV3Plus
 from predict_utils import sliding_window_predict
@@ -35,7 +36,7 @@ INFER_DIR = OUTPUT_DIR / "inference"
 
 def load_model(model_path, device):
     ckpt = torch.load(str(model_path), map_location=device, weights_only=False)
-    model = DeepLabV3Plus(num_classes=5, backbone_pretrained=False,
+    model = DeepLabV3Plus(num_classes=NUM_CLASSES, backbone_pretrained=False,
                           output_stride=16).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()

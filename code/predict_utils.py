@@ -39,9 +39,8 @@ def sliding_window_predict(model, image_tensor, device,
         crop: patch 大小 (默认 512)
         stride: 滑窗步长 (默认 256, 重叠 50%)
         tta: 是否做水平翻转 TTA (每个 patch 翻转推理后翻回取平均)
-    Returns: (num_classes, H, W) softmax probability map on CPU
+        Returns: (num_classes, H, W) softmax probability map on CPU
     """
-    num_classes = 5
     _, Hh, Ww = image_tensor.shape
 
     # 图像小于 crop 时直接整图推理
@@ -65,7 +64,7 @@ def sliding_window_predict(model, image_tensor, device,
         image_tensor = F.pad(image_tensor, (0, pad_w, 0, pad_h), mode="reflect")
         _, Hh, Ww = image_tensor.shape
 
-    prob_sum = torch.zeros(num_classes, Hh, Ww)
+    prob_sum = None  # (C, H, W) 惰性分配, C 从模型输出推断 (类别数不再硬编码)
     count = torch.zeros(1, Hh, Ww)
 
     y_starts = _patch_starts(Hh, crop, stride)
@@ -78,6 +77,8 @@ def sliding_window_predict(model, image_tensor, device,
             with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
                 logits = model(inp)
             prob = F.softmax(logits.float(), dim=1).squeeze(0).cpu()
+            if prob_sum is None:
+                prob_sum = torch.zeros(prob.shape[0], Hh, Ww)
             prob_sum[:, y0:y0+crop, x0:x0+crop] += prob
             count[:, y0:y0+crop, x0:x0+crop] += 1
 

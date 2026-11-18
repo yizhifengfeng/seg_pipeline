@@ -12,7 +12,7 @@ v4 调整 (2026-11-04, 基于 v3 重训 50 epoch 诊断):
     模型尚未饱和, 给后期更充分的探索空间)
   - patience 默认 15 -> 20 (避免 v3 重训中 wait 11/15 接近触发的早停误杀)
   - Focal alpha 默认走 losses.py 的 v4 权重 [0.5, 0.90, 0.65, 1.17, 2.30]
-    (bio 降权抑过度预测 P=0.215/R=0.842; hollow 提权升 recall R=0.323)
+    (bio 降权抑过度预测 P=0.215/R=0.842; v2: hollow 类已移除)
 
 v2 增强 (移植自 stacked_5band_train_842.py 成熟工程技巧):
   1. tqdm 进度条: 训练 batch 级 + 验证场景级, 实时显示 loss
@@ -58,7 +58,7 @@ except ImportError:
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from config import (MASKS_DIR, NORM_STATS_PATH, SPLIT_PATH, OUTPUT_DIR,
-                    CLASS_NAMES, H, W, IGNORE_INDEX, CLASS_PIXEL_COUNTS,
+                    CLASS_NAMES, NUM_CLASSES, H, W, IGNORE_INDEX, CLASS_PIXEL_COUNTS,
                     CLASS_COLORS_RGB)
 from build_input_tensor import load_6channel, normalize_tensor
 from augment import SegmentationAugmentor, compute_sample_weights
@@ -69,7 +69,7 @@ from predict_utils import sliding_window_predict
 TRAIN_DIR = OUTPUT_DIR / "train"
 TRAIN_DIR.mkdir(parents=True, exist_ok=True)
 LATEST_CKPT = TRAIN_DIR / "latest_checkpoint.pth"
-DEFECT_CLASSES = ["crack", "biological_attachment", "flaking", "hollow"]
+DEFECT_CLASSES = ["crack", "biological_attachment", "flaking"]
 
 
 # ── 随机种子 (可复现) ──────────────────────────────────────
@@ -206,7 +206,7 @@ class MetricTracker:
     v2: 新增 per_class_Precision / per_class_Recall (balance score 需要).
     """
 
-    def __init__(self, num_classes=5, ignore_index=IGNORE_INDEX):
+    def __init__(self, num_classes=NUM_CLASSES, ignore_index=IGNORE_INDEX):
         self.nc = num_classes
         self.ignore_index = ignore_index
         self.confusion = np.zeros((num_classes, num_classes), dtype=np.int64)
@@ -308,7 +308,7 @@ def train_one_epoch(model, loader, criterion, optimizer, device,
 def validate(model, dataset, criterion, device, norm_stats, desc="[val]"):
     """滑窗验证整图 (审计 P0#4: 与推理流程对齐)."""
     model.eval()
-    tracker = MetricTracker(5, ignore_index=IGNORE_INDEX)
+    tracker = MetricTracker(NUM_CLASSES, ignore_index=IGNORE_INDEX)
     total_loss, n = 0, 0
     cs = 512
     for s in tqdm(dataset.samples, desc=desc, dynamic_ncols=True, leave=False):
@@ -386,11 +386,11 @@ def plot_confusion(cm, path, title="Confusion Matrix"):
     fig, ax = plt.subplots(1, 1, figsize=(7, 6))
     cm = cm.astype(float); cm = cm / cm.sum(1, keepdims=True).clip(min=1)
     im = ax.imshow(cm, cmap="Blues")
-    ax.set_xticks(range(5)); ax.set_yticks(range(5))
+    ax.set_xticks(range(NUM_CLASSES)); ax.set_yticks(range(NUM_CLASSES))
     ax.set_xticklabels(CLASS_NAMES, rotation=30, ha="right", fontsize=9)
     ax.set_yticklabels(CLASS_NAMES, fontsize=9)
-    for i in range(5):
-        for j in range(5):
+    for i in range(NUM_CLASSES):
+        for j in range(NUM_CLASSES):
             ax.text(j, i, f"{cm[i,j]:.2f}", ha="center", va="center",
                     color="white" if cm[i,j] > 0.5 else "black", fontsize=8)
     ax.set_title(title); fig.colorbar(im)
@@ -485,7 +485,7 @@ def main():
                               num_workers=args.num_workers, pin_memory=True,
                               drop_last=len(train_ds) >= args.batch_size)
 
-    model = DeepLabV3Plus(num_classes=5, backbone_pretrained=True,
+    model = DeepLabV3Plus(num_classes=NUM_CLASSES, backbone_pretrained=True,
                           output_stride=16).to(device)
     class_counts = [CLASS_PIXEL_COUNTS[c] for c in CLASS_NAMES]
     alpha = compute_focal_alpha(class_counts).to(device)

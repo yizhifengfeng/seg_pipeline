@@ -47,8 +47,9 @@ CLASS_FREQ_PATH = CONFIGS_DIR / "class_pixel_counts.json"
 OUTPUT_DIR = ROOT / "outputs"
 
 # ── 模型常量 ────────────────────────────────────────────────
-CLASS_NAMES = ["background", "crack", "biological_attachment", "flaking", "hollow"]
-NUM_CLASSES = 5
+# v2 (2026-11-04): hollow 类移除, 3 类病害 + 背景 = 4 类
+CLASS_NAMES = ["background", "crack", "biological_attachment", "flaking"]
+NUM_CLASSES = 4
 H, W = 1088, 1456
 BAND_NAMES = ["b1", "b2", "b3", "b4", "b5", "pan"]
 
@@ -71,25 +72,24 @@ def _load_class_pixel_counts():
             return {k: int(v) for k, v in data.items()}
     except Exception:
         pass
-    # 内置默认值 (与历史代码一致, 应定期从 configs/class_pixel_counts.json 更新)
+    # 内置默认值 (v3 2026-11-04: 308 有效场景统计, 19 个空标注样本已剔除;
+    # 应定期从 configs/class_pixel_counts.json 更新)
     return {
-        "background": 501586446,
-        "crack": 9719840,
-        "biological_attachment": 10129403,
-        "flaking": 5624990,
-        "hollow": 2038073,
+        "background": 462795280,
+        "crack": 9905901,
+        "biological_attachment": 10045223,
+        "flaking": 5165020,
     }
 
 CLASS_PIXEL_COUNTS = _load_class_pixel_counts()
 
 # ── P2#12: 颜色表 (RGB + BGR 双份, 消除不一致) ─────────────
-# RGB 版本 (用于 matplotlib / PIL)
+# RGB 版本 (用于 matplotlib / PIL); v2: 4 类, hollow 已移除
 CLASS_COLORS_RGB = {
     0: (0, 0, 0),         # background - black
     1: (231, 76, 60),     # crack - red
     2: (52, 152, 219),    # biological_attachment - blue
     3: (46, 204, 113),    # flaking - green
-    4: (243, 156, 18),    # hollow - orange
 }
 # BGR 版本 (用于 OpenCV cv2.imwrite)
 CLASS_COLORS_BGR = {
@@ -97,7 +97,6 @@ CLASS_COLORS_BGR = {
     1: (60, 76, 231),     # = RGB(231,76,60) reversed
     2: (219, 152, 52),    # = RGB(52,152,219) reversed
     3: (113, 204, 46),    # = RGB(46,204,113) reversed
-    4: (18, 156, 243),    # = RGB(243,156,18) reversed
 }
 
 

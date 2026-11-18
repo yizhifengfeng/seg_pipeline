@@ -112,8 +112,28 @@ def load_6channel(stem, category):
     return np.stack(bands, axis=0)
 
 
+def load_rgb(stem, category):
+    """加载 RGB 三通道张量 (b1/b2/b3)。Returns: (3, H, W) float32 [b1,b2,b3].
+
+    方案A 新增 RGB 基线用: b1/b2/b3 在 calibrated 中已对齐到 b2 网格
+    (1456x1088), 直接 imread 即可, 无需 pan 对齐, 零配准风险。
+    物理量纲: 反射率 [0,1] (b1-b5 均做了反射率转换, 与 pan 的 DN 不同)。
+    """
+    cal_dir = CALIBRATED_DIR / category
+    bands = []
+    for i in (1, 2, 3):
+        b = tifffile.imread(str(cal_dir / f"{stem}_b{i}.tif"))
+        bands.append(b.astype(np.float32))
+    return np.stack(bands, axis=0)
+
+
 def normalize_tensor(tensor, norm_stats):
-    """Per-band z-score 归一化。tensor: (6,H,W) or (B,6,H,W)"""
+    """Per-band z-score 归一化。tensor: (6,H,W) or (B,6,H,W)
+
+    v5.4a: 输出钳位到 ±15 —— 正常 z-score (含 pan DN 域与指数通道最坏情形)
+    不超过 ±6~±12, 超界值即数据异常, 会造成 fp16 前向溢出 → BN running
+    stats 污染 → eval 全背景坍缩 (云端 E2 ep2 事故). 钳位是源头防御.
+    """
     mean = np.array(norm_stats["mean"], dtype=np.float32)
     std = np.array(norm_stats["std"], dtype=np.float32)
     if tensor.ndim == 3:
@@ -122,7 +142,8 @@ def normalize_tensor(tensor, norm_stats):
     elif tensor.ndim == 4:
         mean = mean[None, :, None, None]
         std = std[None, :, None, None]
-    return (tensor - mean) / np.maximum(std, 1e-6)
+    out = (tensor - mean) / np.maximum(std, 1e-6)
+    return np.clip(out, -15.0, 15.0, out=out)
 
 
 def load_normalized(stem, category, norm_stats):
@@ -176,6 +197,92 @@ def load_norm_stats_pan():
     pan_stats_path = CONFIGS_DIR / "norm_stats_pan.json"
     with open(pan_stats_path) as f:
         return json.load(f)
+
+
+# ---------------------------------------------------------------------------
+# 光谱指数通道 (阶段二新增, E2/E3 实验)
+# ---------------------------------------------------------------------------
+# 4 个精选归一化差值指数 (b1-b5 为 0 基索引), 固定顺序, 全链路唯一来源.
+# 挑选依据见 lab/spectral_indices_all/phase1/ (全像素 BD + AUC + Otsu 验证):
+#   ndi_b4b5: bio 可分性最强 (AUC 0.884, Otsu 零学习 IoU 0.301)
+#   ndi_b2b3: flaking 空间完整性 (像素级最弱, 交模型验证)
+#   ndi_b2b4: crack vs bg 全像素 BD 第一 (0.099), bio 反方向互补 (与 b4b5 r=-0.55)
+#   ndi_b2b5: 整体缺陷对比度增强
+# 已剔除 ndi_b1b5: 阶段一相关矩阵显示与 ndi_b2b5 r=0.71 / ndi_b2b4 r=0.61,
+#   三者同源冗余, 且无独立类别贡献 (所有 AUC 均被 b2b5 覆盖).
+SPECTRAL_INDICES = [
+    ("ndi_b4b5", 3, 4),   # (b4-b5)/(b4+b5)
+    ("ndi_b2b3", 1, 2),   # (b2-b3)/(b2+b3)
+    ("ndi_b2b4", 1, 3),   # (b2-b4)/(b2+b4)
+    ("ndi_b2b5", 1, 4),   # (b2-b5)/(b2+b5)
+]
+INDEX_NAMES = [n for n, _, _ in SPECTRAL_INDICES]
+INDEX_EPS = 1e-6
+
+
+def compute_index_channels(bands5):
+    """从 5 波段反射率计算 4 个光谱指数通道.
+
+    Args:
+        bands5: (5, H, W) float32 [b1..b5] 反射率域 (增强后的波段同样适用;
+                必须在几何/辐射增强完成后调用 —— 线性插值不保持 (a-b)/(a+b),
+                预计算指数再旋转会污染数值, 见 HANDOFF 坑列表 #17 同类).
+    Returns:
+        (4, H, W) float32, 顺序同 SPECTRAL_INDICES.
+    """
+    assert bands5.shape[0] == 5, f"expect (5,H,W), got {bands5.shape}"
+    out = np.empty((len(SPECTRAL_INDICES), bands5.shape[1], bands5.shape[2]),
+                   dtype=np.float32)
+    for k, (_, i, j) in enumerate(SPECTRAL_INDICES):
+        a = bands5[i]
+        b = bands5[j]
+        out[k] = (a - b) / (a + b + INDEX_EPS)
+    return out
+
+
+def load_5band(stem, category):
+    """加载 5 波段反射率 (无 pan). Returns: (5, H, W) float32 [b1..b5].
+
+    E3 (RGB+指数) 用: 只需 b1-b3 作为模型基座输入, 但指数计算需要全部 5 波段.
+    """
+    cal_dir = CALIBRATED_DIR / category
+    bands = []
+    for i in range(1, 6):
+        b = tifffile.imread(str(cal_dir / f"{stem}_b{i}.tif"))
+        bands.append(b.astype(np.float32))
+    return np.stack(bands, axis=0)
+
+
+def load_indices_input(stem, category, mode):
+    """加载 E2/E3 的完整输入张量 (未增强, val/test 与统计计算共用).
+
+    Args:
+        mode: "ms"  -> (10, H, W) [b1..b5, pan, ndi x4]
+              "rgb" -> (7, H, W)  [b1, b2, b3, ndi x4]
+    """
+    if mode == "ms":
+        base = load_6channel(stem, category)          # (6, H, W)
+        idx = compute_index_channels(base[0:5])      # 从原始反射率计算
+        return np.concatenate([base, idx], axis=0)
+    elif mode == "rgb":
+        bands5 = load_5band(stem, category)          # (5, H, W)
+        idx = compute_index_channels(bands5)
+        return np.concatenate([bands5[0:3], idx], axis=0)
+    raise ValueError(f"unknown mode: {mode}")
+
+
+def load_norm_stats_indices(mode):
+    """加载 E2/E3 归一化统计文件 (train-only).
+
+        mode="ms"  -> norm_stats_indices.json       (10 通道)
+        mode="rgb" -> norm_stats_rgb_indices.json   (7 通道)
+    """
+    fname = {"ms": "norm_stats_indices.json",
+             "rgb": "norm_stats_rgb_indices.json"}[mode]
+    path = CONFIGS_DIR / fname
+    with open(path) as f:
+        return json.load(f)
+
 
 
 if __name__ == "__main__":

@@ -25,13 +25,13 @@ import numpy as np
 # 成功修复 v2 的 820:1 失衡坍缩 (mIoU 0.0664 -> 0.3971).
 # 但 v3 重训 50 epoch 后的 test per-class 诊断仍暴露:
 #   bio: P=0.215 / R=0.842  -> 严重过度预测 (太多像素被误判为 bio)
-#   hollow: P=0.222 / R=0.323 -> 严重欠预测 (真实 hollow 大量漏检)
 # v4 在 v3 基础上手工微调:
 #   bio 0.87 -> 0.65  (降权, 收紧 bio 的预测触发)
-#   hollow 1.94 -> 2.30 (提权, 鼓励模型多预测 hollow)
 #   其余保持 v3 (bg 0.5 下限 / crack 0.90 / flaking 1.17)
-# max/min = 2.30 / 0.5 = 4.6:1 (v3 是 3.9:1, v2 是 820:1; 仍远低于崩塌阈值)
-FOCAL_ALPHA_V4 = [0.5, 0.90, 0.65, 1.17, 2.30]
+# v2 (2026-11-04): hollow 类移除, 4 类权重 [bg, crack, bio, flaking].
+#   hollow 的 2.30 权重随之删除; hollow 训练数据中的像素归入背景.
+# max/min = 1.17 / 0.5 = 2.3:1 (v3 是 3.9:1, v2 是 820:1; 远低于崩塌阈值)
+FOCAL_ALPHA_V4 = [0.5, 0.90, 0.65, 1.17]
 
 
 # ---------------------------------------------------------------------------
@@ -57,7 +57,7 @@ class FocalLoss(nn.Module):
       then multiplies by ``alpha_t`` -- matching the original Focal Loss paper.
     """
 
-    def __init__(self, gamma=2.0, alpha=None, num_classes=5, ignore_index=-100):
+    def __init__(self, gamma=2.0, alpha=None, num_classes=4, ignore_index=-100):
         super().__init__()
         self.gamma = gamma
         self.ignore_index = ignore_index
@@ -75,6 +75,17 @@ class FocalLoss(nn.Module):
         target: (B, H, W) long
         """
         B, C, H, W = logits.shape
+        # 类别一致性校验 (v5.2): alpha 长度必须等于 logits 通道数.
+        # 否则下面的 alpha[target] 在 CUDA 上是 index-out-of-bounds,
+        # 表现为 device-side assert (IndexKernel.cu) 并直接杀死进程、
+        # 污染 CUDA 上下文 —— v5 从 5 类切 4 类时的真实事故就是
+        # "5 通道 logits + 4 个 alpha 权重"。这里提前给出可读报错.
+        if self.alpha is not None and self.alpha.numel() != C:
+            raise ValueError(
+                f"FocalLoss alpha 长度 ({self.alpha.numel()}) != logits 类别数 ({C}). "
+                f"compute_focal_alpha 的 v4 模式固定返回 {len(FOCAL_ALPHA_V4)} 个权重, "
+                f"请确认调用方的类别数与之同步 (config.NUM_CLASSES)."
+            )
         # Flatten to (N, C) where N = B*H*W. Must permute channel to last dim
         # so each row = [class0_logit, class1_logit, ...] for one pixel.
         logits_flat = logits.permute(0, 2, 3, 1).reshape(-1, C)   # (N, C)
@@ -178,7 +189,7 @@ class BoundaryLoss(nn.Module):
       and potential device mismatch).
     """
 
-    def __init__(self, num_classes=5, ignore_index=-100):
+    def __init__(self, num_classes=4, ignore_index=-100):
         super().__init__()
         self.num_classes = num_classes
         self.ignore_index = ignore_index
@@ -232,7 +243,7 @@ class CombinedLoss(nn.Module):
                       (use 255 for non-facade regions: sky, windows, doors, etc.)
     """
 
-    def __init__(self, num_classes=5, gamma=2.0, alpha=None,
+    def __init__(self, num_classes=4, gamma=2.0, alpha=None,
                  lambda_focal=1.0, lambda_lovasz=1.0, lambda_boundary=0.5,
                  ignore_index=-100):
         super().__init__()
@@ -258,7 +269,7 @@ class CombinedLoss(nn.Module):
 # ---------------------------------------------------------------------------
 # Helper: compute inverse-frequency alpha from class pixel counts
 # ---------------------------------------------------------------------------
-def compute_focal_alpha(class_pixel_counts=None, num_classes=5, bg_min=0.5,
+def compute_focal_alpha(class_pixel_counts=None, num_classes=4, bg_min=0.5,
                         algorithm="v4"):
     """Compute alpha (per-class weight).
 
@@ -266,8 +277,8 @@ def compute_focal_alpha(class_pixel_counts=None, num_classes=5, bg_min=0.5,
         手工微调的 v4 权重 FOCAL_ALPHA_V4 = [0.5, 0.90, 0.65, 1.17, 2.30].
         基于 v3 重训 50 epoch 的诊断:
           bio P=0.215/R=0.842 过度预测 -> 降权 0.87->0.65
-          hollow P=0.222/R=0.323 欠预测 -> 提权 1.94->2.30
-        max/min = 4.6:1, 仍远低于 v2 的 820:1 崩塌阈值.
+        v2(2026-11-04): hollow 移除, 4 类权重 [0.5, 0.90, 0.65, 1.17],
+        max/min = 2.3:1, 仍远低于 v2 的 820:1 崩塌阈值.
         class_pixel_counts 参数在此模式下被忽略 (留作 API 兼容).
 
     algorithm="sqrt_inverse" (v3 算法, fallback):
@@ -305,7 +316,7 @@ if __name__ == "__main__":
     # Quick test
     torch.manual_seed(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    B, C, H, W = 2, 5, 256, 256
+    B, C, H, W = 2, 4, 256, 256
     logits = torch.randn(B, C, H, W, device=device, requires_grad=True)
     target = torch.randint(0, C, (B, H, W), device=device)
     # Add some ignore pixels

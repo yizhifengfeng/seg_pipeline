@@ -46,7 +46,7 @@ except ImportError:
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from config import (MASKS_DIR, SPLIT_PATH, OUTPUT_DIR, CONFIGS_DIR,
-                    CLASS_NAMES, H, W, IGNORE_INDEX, CLASS_PIXEL_COUNTS,
+                    CLASS_NAMES, NUM_CLASSES, H, W, IGNORE_INDEX, CLASS_PIXEL_COUNTS,
                     CLASS_COLORS_RGB)
 from build_input_tensor import load_pan_only, normalize_pan_tensor, load_norm_stats_pan
 from augment import SegmentationAugmentor, compute_sample_weights
@@ -57,7 +57,7 @@ from predict_utils import sliding_window_predict
 TRAIN_DIR = OUTPUT_DIR / "train_baseline"
 TRAIN_DIR.mkdir(parents=True, exist_ok=True)
 LATEST_CKPT = TRAIN_DIR / "latest_checkpoint.pth"
-DEFECT_CLASSES = ["crack", "biological_attachment", "flaking", "hollow"]
+DEFECT_CLASSES = ["crack", "biological_attachment", "flaking"]
 
 
 def set_seed(seed=42):
@@ -226,7 +226,7 @@ class PanDataset(Dataset):
 class MetricTracker:
     """与 train.py 完全一致 (向量化 + ignore_index + v2 P/R)."""
 
-    def __init__(self, num_classes=5, ignore_index=IGNORE_INDEX):
+    def __init__(self, num_classes=NUM_CLASSES, ignore_index=IGNORE_INDEX):
         self.nc = num_classes
         self.ignore_index = ignore_index
         self.confusion = np.zeros((num_classes, num_classes), dtype=np.int64)
@@ -316,7 +316,7 @@ def train_one_epoch(model, loader, criterion, optimizer, device,
 def validate(model, dataset, criterion, device, norm_stats, desc="[val]"):
     """滑窗验证整图 (与 train.py 一致, v2: tqdm)."""
     model.eval()
-    tracker = MetricTracker(5, ignore_index=IGNORE_INDEX)
+    tracker = MetricTracker(NUM_CLASSES, ignore_index=IGNORE_INDEX)
     total_loss, n = 0, 0
     cs = 512
     for s in tqdm(dataset.samples, desc=desc, dynamic_ncols=True, leave=False):
@@ -391,11 +391,11 @@ def plot_confusion(cm, path, title="Confusion Matrix (Baseline)"):
     fig, ax = plt.subplots(1, 1, figsize=(7, 6))
     cm = cm.astype(float); cm = cm / cm.sum(1, keepdims=True).clip(min=1)
     im = ax.imshow(cm, cmap="Blues")
-    ax.set_xticks(range(5)); ax.set_yticks(range(5))
+    ax.set_xticks(range(NUM_CLASSES)); ax.set_yticks(range(NUM_CLASSES))
     ax.set_xticklabels(CLASS_NAMES, rotation=30, ha="right", fontsize=9)
     ax.set_yticklabels(CLASS_NAMES, fontsize=9)
-    for i in range(5):
-        for j in range(5):
+    for i in range(NUM_CLASSES):
+        for j in range(NUM_CLASSES):
             ax.text(j, i, f"{cm[i,j]:.2f}", ha="center", va="center",
                     color="white" if cm[i,j] > 0.5 else "black", fontsize=8)
     ax.set_title(title); fig.colorbar(im)
@@ -495,7 +495,7 @@ def main():
                               num_workers=args.num_workers, pin_memory=True,
                               drop_last=len(train_ds) >= args.batch_size)
 
-    model = DeepLabV3PlusBaseline(num_classes=5, backbone_pretrained=True,
+    model = DeepLabV3PlusBaseline(num_classes=NUM_CLASSES, backbone_pretrained=True,
                                   output_stride=16).to(device)
     print(f"Model: DeepLabV3PlusBaseline | params={model.count_parameters():,}")
 
